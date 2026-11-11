@@ -1,0 +1,8 @@
+.pio/
+build/
+managed_components/
+sdkconfig.fancoil
+sdkconfig.*.old
+.DS_Store
+__pycache__/
+*.py[cod]

@@ -1,0 +1,29 @@
+# FanCoil.co.uk firmware — build defaults (ESP32-C2, 2 MB, lean for the 896 KB slot)
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# CRITICAL: this board's crystal is 26 MHz, NOT the IDF default of 40 MHz. With the wrong
+# value every XTAL-derived clock is off by 26/40 — the ROM log prints at 74880 instead of
+# 115200, and (fatally) WiFi RF calibration crashes app_main in a silent boot loop.
+CONFIG_XTAL_FREQ_26=y
+
+# UART0 (GPIO20 TX / GPIO19 RX) is the panel-MCU link, so the serial console must NOT use
+# it — the console bytes would collide with MCU frames. Diagnostics come over the network
+# instead (GET /log raw sniffer, GET /mcu/test).
+CONFIG_ESP_CONSOLE_UART_NONE=y
+
+# Bigger main task stack (OTA + JSON + http handlers run work here).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
+# App rollback: a freshly-OTA'd image boots as PENDING_VERIFY; if it crashes/boot-loops
+# before main.c marks it valid (~30 s uptime), the bootloader auto-reverts to the previous
+# slot. A reliability net for unattended wall units — NOT a lock (the device stays openly
+# flashable). mark-valid is gated on uptime only, so a good build that merely can't reach
+# WiFi is never rolled back.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# Watchdog: reset the chip if a task hangs/deadlocks — robustness for an unattended wall unit.
+# 15 s is generous (normal task loops are <250 ms) so flash writes / OTA won't false-trigger.
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y

@@ -1,0 +1,4 @@
+# Managed-component dependencies (fetched by the IDF component manager at build time).
+# mDNS moved out of ESP-IDF core at v5.0, so it must be pulled in explicitly.
+dependencies:
+  espressif/mdns: ">=1.4.0"

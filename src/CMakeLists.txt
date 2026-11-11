@@ -1,0 +1,22 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "mcu_link.c"
+        "http_api.c"
+        "mcu_protocol.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        esp_wifi
+        esp_netif
+        esp_event
+        nvs_flash
+        esp_http_server
+        app_update
+        esp_app_format
+        driver
+        json
+        esp_timer
+        esp_system
+        esp_hw_support
+        mdns
+)
