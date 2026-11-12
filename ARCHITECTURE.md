@@ -66,7 +66,11 @@ clearing only the Wi-Fi credentials.
 `GET /state` reports `power`, `mode`, `setpoint_c`, `fan`, `key_lock`, `room_temp_c`,
 `heating`/`cooling`, limits (`heat_top`, `cool_bot`), tuning (`adj`, `tolr`, `antif`,
 `fan_delay`), plus `mac`, `model`, `fw`, link health (`valid`, `link_up`, `rtt_ms`, frame
-counters). `POST /set` accepts any subset of the writable fields (`power`, `mode`,
+counters). When the unit is **off**, `mode`, `setpoint_c` and `fan` are reported as `null`
+(they describe nothing it's doing — the panel only retains them), so a consumer never sees
+a stale speed or setpoint; `room_temp_c`, the limits and `key_lock` stay reported.
+
+`POST /set` accepts any subset of the writable fields (`power`, `mode`,
 `setpoint`, `fan`, `lock`, `heat_top`, `cool_bot`, `adj`, `tolr`, `antif`, `fan_delay`).
 
 The API is unauthenticated by design — the device is meant for a trusted LAN, and `POST /ota`

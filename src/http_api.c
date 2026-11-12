@@ -93,10 +93,19 @@ static esp_err_t h_state(httpd_req_t *r) {
     if (mcu_get_state(&st)) {
         cJSON_AddBoolToObject(j, "valid", true);
         cJSON_AddBoolToObject(j, "power", st.power);
-        cJSON_AddNumberToObject(j, "mode", st.mode);
-        cJSON_AddNumberToObject(j, "setpoint_c", st.temp_set);
+        // Powered off: mode/setpoint/fan describe nothing the unit is doing — the panel
+        // just retains the last settings — so report null, not a stale value. room_temp
+        // is a live reading and the limits/lock persist, so those stay reported.
+        if (st.power) {
+            cJSON_AddNumberToObject(j, "mode", st.mode);
+            cJSON_AddNumberToObject(j, "setpoint_c", st.temp_set);
+            cJSON_AddNumberToObject(j, "fan", st.fan_speed);
+        } else {
+            cJSON_AddNullToObject(j, "mode");
+            cJSON_AddNullToObject(j, "setpoint_c");
+            cJSON_AddNullToObject(j, "fan");
+        }
         cJSON_AddNumberToObject(j, "room_temp_c", st.current_temp);
-        cJSON_AddNumberToObject(j, "fan", st.fan_speed);
         cJSON_AddBoolToObject(j, "heating", st.is_heating);
         cJSON_AddBoolToObject(j, "cooling", st.is_cooling);
         cJSON_AddBoolToObject(j, "key_lock", st.key_lock);
