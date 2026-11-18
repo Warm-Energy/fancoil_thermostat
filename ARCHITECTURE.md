@@ -48,6 +48,15 @@ frames on command and decodes incoming status into the shared `fc_state_t` that 
 serves. A reset-request in the status flags is honoured as **reprovision** (drop to SoftAP),
 clearing only the Wi-Fi credentials.
 
+Every frame goes through one paced slot with a 300 ms gap after it, so the MCU never has two
+replies in flight, and the task stays silent for 1 s after boot. The link is `up` (a valid
+frame within 5 s), `boot`, `desync` (bytes but no valid frame) or `silent`. When it isn't
+`up` the task runs a recovery ladder on its own — reinstall the UART driver, go quiet for 3 s,
+then poll with two back-to-back hellos — and backs off 30 s → 5 min between rounds. The
+two-hello poll covers an MCU-side fault where every reply arrives with its `5B B5` header
+missing until the thermostat is power-cycled: the second reply comes out intact, so the link
+stays live in **pair mode** (`degraded`) and retries single polls every 5 min.
+
 ## Local HTTP API
 
 `esp_http_server` on port 80. Routes:
@@ -61,12 +70,16 @@ clearing only the Wi-Fi credentials.
 | `/wifi` | POST | set Wi-Fi credentials (provisioning) |
 | `/reboot` | POST | reboot the device |
 | `/log` | GET | raw MCU frame sniffer (diagnostics) |
-| `/mcu/test`, `/light` | GET | MCU link diagnostics |
+| `/mcu/test`, `/light` | GET | MCU link diagnostics (state, counters, verdict) |
+| `/mcu/trace` | GET | timeline of the last ~32 frames sent / bursts received + recovery notes |
+| `/mcu/recover?step=` | POST | run a recovery step: `auto`, `uart_reset`, `quiet`, `pair_poll`, `break` |
+| `/mcu/raw` | POST | send one test frame `{"type":n,"payload":"hex"}` (MCU-upgrade frames refused) |
 
 `GET /state` reports `power`, `mode`, `setpoint_c`, `fan`, `key_lock`, `room_temp_c`,
 `heating`/`cooling`, limits (`heat_top`, `cool_bot`), tuning (`adj`, `tolr`, `antif`,
-`fan_delay`), plus `mac`, `model`, `fw`, link health (`valid`, `link_up`, `rtt_ms`, frame
-counters). When the unit is **off**, `mode`, `setpoint_c` and `fan` are reported as `null`
+`fan_delay`), plus `mac`, `model`, `fw`, link health (`valid`, `link_up`, `link` =
+`up`/`desync`/`silent`/`boot`, `degraded`, `rtt_ms`, frame counters). `valid` stays true once
+any status frame has arrived; use `link` for whether the data is current. When the unit is **off**, `mode`, `setpoint_c` and `fan` are reported as `null`
 (they describe nothing it's doing — the panel only retains them), so a consumer never sees
 a stale speed or setpoint; `room_temp_c`, the limits and `key_lock` stay reported.
 

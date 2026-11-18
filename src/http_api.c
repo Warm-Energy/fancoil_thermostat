@@ -20,14 +20,17 @@ static const char *TAG = "api";
 static httpd_handle_t s_srv;
 
 // "Test MCU connection" widget, appended to every page of the root UI. Pokes GET /mcu/test
-// and shows the verdict + raw health JSON. No external deps.
+// and shows the verdict + raw health JSON; "Resync" kicks the recovery ladder. No external deps.
 static const char *MCU_TEST_HTML =
     "<h3>MCU link</h3>"
-    "<button onclick=\"mt()\">Test MCU connection</button> <b id=mv></b>"
+    "<button onclick=\"mt()\">Test MCU connection</button> "
+    "<button onclick=\"fetch('/mcu/recover?step=auto',{method:'POST'}).then(_=>{mv.textContent=' resyncing...';"
+    "setTimeout(mt,8000)})\">Resync now</button> "
+    "<a href=/mcu/trace>timeline</a> <a href=/log>raw bytes</a> <b id=mv></b>"
     "<pre id=mo style=\"white-space:pre-wrap;background:#f4f4f4;padding:8px\"></pre>"
     "<script>function mt(){mv.textContent=' testing...';mo.textContent='';"
     "fetch('/mcu/test').then(r=>r.json()).then(j=>{"
-    "mv.textContent=j.ok?' [OK]':' [NO REPLY]';"
+    "mv.textContent=' ['+j.state.toUpperCase()+(j.pair_mode?', degraded':'')+']';"
     "mo.textContent=j.verdict+'\\n\\n'+JSON.stringify(j,null,2);})"
     ".catch(e=>{mv.textContent=' error';mo.textContent=''+e;})}</script>";
 
@@ -89,6 +92,10 @@ static esp_err_t h_state(httpd_req_t *r) {
     cJSON_AddStringToObject(j, "model", "FanCoil.co.uk");
     const esp_app_desc_t *app = esp_app_get_description();
     cJSON_AddStringToObject(j, "fw", app ? app->version : "?");
+    mcu_health_t h;
+    mcu_get_health(&h);
+    cJSON_AddStringToObject(j, "link", mcu_link_state_name(h.state));   // up/desync/silent/boot
+    cJSON_AddBoolToObject(j, "degraded", h.pair_mode);
 
     if (mcu_get_state(&st)) {
         cJSON_AddBoolToObject(j, "valid", true);
@@ -233,16 +240,41 @@ static esp_err_t h_mcu_test(httpd_req_t *r) {
     cJSON_AddNumberToObject(j, "tx_frames", h.tx_frames);
     if (h.last_rx_ms    >= 0) cJSON_AddNumberToObject(j, "last_rx_ms", h.last_rx_ms);       else cJSON_AddNullToObject(j, "last_rx_ms");
     if (h.last_frame_ms >= 0) cJSON_AddNumberToObject(j, "last_frame_ms", h.last_frame_ms); else cJSON_AddNullToObject(j, "last_frame_ms");
+    cJSON_AddStringToObject(j, "state", mcu_link_state_name(h.state));
+    cJSON_AddBoolToObject(j, "pair_mode", h.pair_mode);
+    cJSON_AddNumberToObject(j, "ck_frames", h.ck_frames);
+    cJSON_AddNumberToObject(j, "bad_ck", h.bad_ck);
+    cJSON_AddNumberToObject(j, "bad_len", h.bad_len);
+    cJSON_AddNumberToObject(j, "skipped", h.skipped);
+    cJSON_AddNumberToObject(j, "rx_bursts", h.rx_bursts);
+    cJSON_AddNumberToObject(j, "headerless", h.headerless);
+    cJSON_AddNumberToObject(j, "rec_attempts", h.rec_attempts);
+    cJSON_AddNumberToObject(j, "recoveries", h.recoveries);
+    if (h.rec_active)       cJSON_AddStringToObject(j, "rec_active", h.rec_active);   else cJSON_AddNullToObject(j, "rec_active");
+    if (h.rec_last_ok)      cJSON_AddStringToObject(j, "rec_last_ok", h.rec_last_ok); else cJSON_AddNullToObject(j, "rec_last_ok");
+    if (h.rec_next_ms >= 0) cJSON_AddNumberToObject(j, "rec_next_ms", h.rec_next_ms); else cJSON_AddNullToObject(j, "rec_next_ms");
+    cJSON_AddNumberToObject(j, "heap", esp_get_free_heap_size());
 
     const char *verdict;
-    if (ok && h.status_valid)
+    if (h.state == MCU_LINK_UP && h.pair_mode)
+        verdict = "DEGRADED: the MCU's single replies arrive shifted (5B B5 header lost inside "
+                  "the MCU), so we poll with back-to-back hello pairs to get intact frames. "
+                  "Power-cycle the thermostat to clear it; single polls are retried every 5 min.";
+    else if (h.state == MCU_LINK_UP)
         verdict = "MCU link OK - receiving and decoding status frames.";
-    else if (ok && !h.status_valid)
-        verdict = "MCU is sending bytes but no valid status frame decoded yet - likely a "
-                  "protocol/baud mismatch (bytes arrive, framing is off).";
+    else if (h.state == MCU_LINK_BOOT)
+        verdict = "Link starting (first few seconds after boot) - test again shortly.";
+    else if (h.state == MCU_LINK_DESYNC && h.headerless > 4 * h.bad_ck)
+        verdict = "MCU is answering, but its replies arrive WITHOUT the 5B B5 header - each "
+                  "reply is shifted inside the MCU (not an ESP framing problem). Auto-recovery "
+                  "is running (see rec_*); if it can't get frames, power-cycle the thermostat. "
+                  "Timeline: /mcu/trace";
+    else if (h.state == MCU_LINK_DESYNC && h.bad_ck)
+        verdict = "Frames arrive with bad checksums - line noise, a loose wire or wrong baud.";
+    else if (h.state == MCU_LINK_DESYNC)
+        verdict = "MCU is sending bytes but no valid status frame decodes. Timeline: /mcu/trace";
     else if (h.link_up)
-        verdict = "No fresh reply to the probe, but bytes were seen earlier - link may be "
-                  "stale or the MCU went quiet. Retry.";
+        verdict = "MCU has gone quiet (bytes were seen earlier). Auto-recovery is running.";
     else
         verdict = "No response from the MCU. Check wiring (ESP TX=GPIO20 -> MCU RX, "
                   "ESP RX=GPIO19 <- MCU TX - do not swap), MCU power, and 9600 8N1.";
@@ -254,6 +286,58 @@ static esp_err_t h_mcu_test(httpd_req_t *r) {
     if (s) cJSON_free(s);
     cJSON_Delete(j);
     return ESP_OK;
+}
+
+// TX/RX timeline: every frame we sent and every burst the MCU sent back, with ms timestamps
+// and recovery notes. The thing to read when the link misbehaves.
+static esp_err_t h_mcu_trace(httpd_req_t *r) {
+    const int max = 11 * 1024;
+    char *buf = malloc(max);
+    if (!buf) return fail(r, "no memory");
+    int n = mcu_trace_dump(buf, max);
+    httpd_resp_set_type(r, "text/plain");
+    httpd_resp_send(r, buf, n);
+    free(buf);
+    return ESP_OK;
+}
+
+// POST /mcu/recover?step=auto|uart_reset|quiet|pair_poll|break — run a recovery step now.
+static esp_err_t h_mcu_recover(httpd_req_t *r) {
+    char q[48], step[16] = "auto";
+    if (httpd_req_get_url_query_str(r, q, sizeof q) == ESP_OK)
+        httpd_query_key_value(q, "step", step, sizeof step);
+    if (!mcu_recover(step)) {
+        httpd_resp_set_status(r, "400 Bad Request");
+        return httpd_resp_sendstr(r, "step must be auto, uart_reset, quiet, pair_poll or break");
+    }
+    char msg[48];
+    snprintf(msg, sizeof msg, "started %s - see /mcu/test", step);
+    return httpd_resp_sendstr(r, msg);
+}
+
+// Dev: POST /mcu/raw {"type":31,"payload":"01"} — send one frame (framed + checksummed
+// here). MCU upgrade frames are refused (see mcu_send_raw).
+static esp_err_t h_mcu_raw(httpd_req_t *r) {
+    char buf[200];
+    body_read(r, buf, sizeof buf);
+    cJSON *j = cJSON_Parse(buf);
+    cJSON *t = j ? cJSON_GetObjectItem(j, "type") : NULL;
+    const char *hex = j ? cJSON_GetStringValue(cJSON_GetObjectItem(j, "payload")) : NULL;
+    uint8_t p[56];
+    int len = 0;
+    bool ok = t && cJSON_IsNumber(t);
+    for (const char *h = hex; ok && h && h[0] && h[1]; h += 2) {
+        unsigned v;
+        if (len >= (int)sizeof p || sscanf(h, "%2x", &v) != 1) ok = false;
+        else p[len++] = (uint8_t)v;
+    }
+    ok = ok && mcu_send_raw((uint8_t)cJSON_GetNumberValue(t), p, (uint16_t)len);
+    cJSON_Delete(j);
+    if (!ok) {
+        httpd_resp_set_status(r, "400 Bad Request");
+        return httpd_resp_sendstr(r, "refused: need {type:n, payload:\"hex\"}; upgrade frames are blocked");
+    }
+    return httpd_resp_sendstr(r, "queued - see /mcu/trace");
 }
 
 // Dev: set the MCU panel-light state directly — GET /light?s=N sets payload[0] of the 0x0F
@@ -289,7 +373,7 @@ static esp_err_t h_reboot(httpd_req_t *r) {
 void http_api_start(bool ap_mode) {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size        = 8192;        // OTA handler needs headroom
-    cfg.max_uri_handlers  = 12;
+    cfg.max_uri_handlers  = 16;
     cfg.lru_purge_enable  = true;
     cfg.recv_wait_timeout = 20;
     cfg.send_wait_timeout = 20;
@@ -305,6 +389,9 @@ void http_api_start(bool ap_mode) {
     REG("/wifi",  HTTP_POST, h_wifi,  NULL);
     REG("/log",   HTTP_GET,  h_log,   NULL);
     REG("/mcu/test", HTTP_GET, h_mcu_test, NULL);
+    REG("/mcu/trace",   HTTP_GET,  h_mcu_trace,   NULL);
+    REG("/mcu/recover", HTTP_POST, h_mcu_recover, NULL);
+    REG("/mcu/raw",     HTTP_POST, h_mcu_raw,     NULL);
     REG("/light",    HTTP_GET, h_light,    NULL);
     REG("/reboot",   HTTP_POST, h_reboot,  NULL);
 #undef REG

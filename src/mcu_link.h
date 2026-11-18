@@ -37,14 +37,34 @@ void mcu_set_light(int state);
 int mcu_sniffer_dump(char *out, int max);
 
 // --- Link health, for the "test MCU connection" diagnostic (GET /mcu/test) ---
+// Link state: UP = a valid status frame within the last 5 s. DESYNC = bytes keep arriving
+// but none of them form a valid frame. SILENT = nothing at all from the MCU.
+typedef enum { MCU_LINK_BOOT, MCU_LINK_UP, MCU_LINK_DESYNC, MCU_LINK_SILENT } mcu_link_state_t;
+const char *mcu_link_state_name(mcu_link_state_t s);
+
 typedef struct {
     bool     link_up;        // any bytes received from the MCU since boot
     bool     status_valid;   // at least one status frame decoded
+    mcu_link_state_t state;
+    bool     pair_mode;      // degraded: polling with back-to-back hello pairs (see .c)
     uint32_t rx_bytes;       // total bytes received from the MCU
     uint32_t rx_frames;      // valid status frames decoded
     uint32_t tx_frames;      // frames we have sent to the MCU
     int32_t  last_rx_ms;     // ms since the last byte from the MCU    (-1 = never)
     int32_t  last_frame_ms;  // ms since the last decoded status frame (-1 = never)
+    // parser / burst diagnostics
+    uint32_t ck_frames;      // checksum-valid frames of any type
+    uint32_t bad_ck;         // header seen, checksum wrong (line noise / wrong baud)
+    uint32_t bad_len;        // header seen, impossible length
+    uint32_t skipped;        // bytes that never belonged to a frame
+    uint32_t rx_bursts;      // contiguous RX bursts (≈ one per MCU reply)
+    uint32_t headerless;     // bursts of >=8 bytes with no valid frame in them
+    // auto-recovery
+    uint32_t rec_attempts;   // recovery steps run
+    uint32_t recoveries;     // times the link came back after a recovery step
+    const char *rec_active;  // step in progress, or NULL
+    const char *rec_last_ok; // step that last brought the link back, or NULL
+    int32_t  rec_next_ms;    // ms until the next ladder run (-1 = not scheduled)
 } mcu_health_t;
 void mcu_get_health(mcu_health_t *out);
 
@@ -52,3 +72,15 @@ void mcu_get_health(mcu_health_t *out);
 // fresh reply. Returns true if the MCU answered; *rtt_ms (if non-NULL) gets the round
 // trip in ms. Safe to call from another task (e.g. an HTTP handler).
 bool mcu_probe(int timeout_ms, int *rtt_ms);
+
+// Manually run one recovery step: "uart_reset", "quiet", "pair_poll", "break", or "auto"
+// (restart the whole ladder now). Returns false for an unknown name. Non-blocking.
+bool mcu_recover(const char *step);
+
+// Dev: queue one raw frame (type + payload, framed/checksummed here). Refuses the MCU
+// upgrade types — 0x16 data and any 0x0F other than the panel-light values 1/2.
+bool mcu_send_raw(uint8_t type, const uint8_t *payload, uint16_t len);
+
+// Write the TX/RX timeline (last ~32 frames sent and bursts received, with ms timestamps)
+// as text into `out`. Returns the number of bytes written.
+int mcu_trace_dump(char *out, int max);

@@ -64,14 +64,21 @@ size_t fc_time        (uint8_t *out, uint8_t weekday, // y/m/d/h/m/s — layout:
                        uint8_t hour, uint8_t minute, uint8_t second);
 
 // ---- Streaming RX parser: feed bytes; returns 1 when a status frame decoded into `st`. ----
+// Resyncing: a false start (bad length/checksum) drops ONE byte and rescans the rest, so a
+// stray 5B/5C can never swallow the real frame behind it. Counters are cumulative.
 typedef struct {
   uint8_t  buf[64];
   uint16_t idx;
-  uint16_t need;   // total frame length once known (len+8), else 0
+  uint16_t last_len;  // length of the most recent checksum-valid frame
+  uint32_t frames;    // checksum-valid frames (any type)
+  uint32_t bad_ck;    // plausible header + length, checksum wrong
+  uint32_t bad_len;   // header with a length that can't fit
+  uint32_t skipped;   // bytes discarded while hunting for a start magic
 } fc_parser_t;
 
-void fc_parser_reset(fc_parser_t *p);
-// Returns 1 and fills *st when a valid status frame (type 0x01/0x12) completes; else 0.
+void fc_parser_reset(fc_parser_t *p);   // clears buffer AND counters
+void fc_parser_flush(fc_parser_t *p);   // drops buffered bytes, keeps counters
+// Returns 1 and fills *st when a valid status frame (type 0x01/0x0F/0x12) completes; else 0.
 int  fc_parse_byte(fc_parser_t *p, uint8_t b, fc_state_t *st);
 
 #ifdef __cplusplus

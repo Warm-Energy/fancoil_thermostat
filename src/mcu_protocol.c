@@ -66,12 +66,15 @@ size_t fc_time(uint8_t *out, uint8_t weekday, uint8_t hour, uint8_t minute, uint
 }
 
 // --------------------------- streaming RX parser ---------------------------
-void fc_parser_reset(fc_parser_t *p) { p->idx = 0; p->need = 0; }
+void fc_parser_reset(fc_parser_t *p) { memset(p, 0, sizeof(*p)); }
+void fc_parser_flush(fc_parser_t *p) { p->idx = 0; }
 
 static int fc_decode_status(const uint8_t *f, uint16_t total, fc_state_t *st) {
   // f[2]=type; payload starts at f[6]; status fields are at FRAME offsets (per RE).
+  // The MCU answers our 0x0F panel-light frame with a type-0x0F reply whose body is the
+  // same 41-byte status block (byte-identical to the 0x01 reply apart from type/cksum).
   uint8_t type = f[2];
-  if (type != 0x01 && type != 0x12) return 0;
+  if (type != 0x01 && type != 0x0F && type != 0x12) return 0;
   if (total < 0x24) return 0;                 // need through offset 0x21 (+cksum)
   uint8_t flags = f[0x0C];
   memset(st, 0, sizeof(*st));
@@ -96,34 +99,35 @@ static int fc_decode_status(const uint8_t *f, uint16_t total, fc_state_t *st) {
   return 1;
 }
 
+static void drop(fc_parser_t *p, uint16_t n) {
+  memmove(p->buf, p->buf + n, p->idx - n);
+  p->idx -= n;
+}
+
 int fc_parse_byte(fc_parser_t *p, uint8_t b, fc_state_t *st) {
-  // Byte 0: a start magic (accept both 0x5B and 0x5C; checksum is the real guard).
-  if (p->idx == 0) {
-    if (b == FC_MAGIC0_RX || b == FC_MAGIC0_TX) { p->buf[p->idx++] = b; p->need = 0; }
-    return 0;
-  }
-  if (p->idx == 1) {                       // byte 1: 0xB5 for MCU->ESP (RX), 0xC5 for ESP->MCU
-    if (b == FC_MAGIC1_RX || b == FC_MAGIC1) { p->buf[p->idx++] = b; return 0; }
-    // resync: maybe this byte is a fresh start magic
-    p->idx = 0;
-    if (b == FC_MAGIC0_RX || b == FC_MAGIC0_TX) p->buf[p->idx++] = b;
-    return 0;
-  }
+  if (p->idx >= sizeof(p->buf)) drop(p, 1);   // unreachable (lengths are capped); stay safe
   p->buf[p->idx++] = b;
-  if (p->idx == 5) {                        // have len(16LE) at [3..4]
-    uint16_t len = (uint16_t)p->buf[3] | ((uint16_t)p->buf[4] << 8);
-    p->need = (uint16_t)len + 8;
-    if (p->need > sizeof(p->buf)) { fc_parser_reset(p); return 0; }  // bogus length
-  }
-  if (p->need && p->idx >= p->need) {
-    uint16_t len = p->need - 8;
+  int got = 0;
+  // Start magic is 5B B5 (MCU->ESP) or 5C C5 (ESP->MCU, seen when tapping our own TX);
+  // either byte pairing is accepted — the length + checksum are the real guard.
+  while (p->idx) {
+    uint8_t m0 = p->buf[0];
+    if (m0 != FC_MAGIC0_RX && m0 != FC_MAGIC0_TX) { drop(p, 1); p->skipped++; continue; }
+    if (p->idx < 2) break;
+    uint8_t m1 = p->buf[1];
+    if (m1 != FC_MAGIC1_RX && m1 != FC_MAGIC1) { drop(p, 1); p->skipped++; continue; }
+    if (p->idx < 5) break;
+    uint16_t need = (uint16_t)(((uint16_t)p->buf[3] | ((uint16_t)p->buf[4] << 8)) + 8);
+    if (need > sizeof(p->buf)) { drop(p, 1); p->bad_len++; continue; }
+    if (p->idx < need) break;
+    uint16_t len = need - 8;
     uint16_t ck  = fc_cksum(p->buf, 6 + len);
-    uint16_t got = (uint16_t)p->buf[6 + len] | ((uint16_t)p->buf[7 + len] << 8);
-    int ok = 0;
-    if (ck == got) ok = fc_decode_status(p->buf, p->need, st);
-    fc_parser_reset(p);
-    return ok;
+    uint16_t sum = (uint16_t)p->buf[6 + len] | ((uint16_t)p->buf[7 + len] << 8);
+    if (ck != sum) { drop(p, 1); p->bad_ck++; continue; }   // false start: rescan from next byte
+    p->frames++;
+    p->last_len = need;
+    if (fc_decode_status(p->buf, need, st)) got = 1;
+    drop(p, need);
   }
-  if (p->idx >= sizeof(p->buf)) fc_parser_reset(p);  // safety
-  return 0;
+  return got;
 }
