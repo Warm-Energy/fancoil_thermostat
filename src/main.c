@@ -2,7 +2,8 @@
 //
 // Provisioning policy (secure by default — this firmware NEVER auto-opens an AP):
 //   * creds present      -> STA; reconnect forever with 5 s backoff; never falls back to AP.
-//   * no creds, no flag   -> IDLE: WiFi stays off, device dormant (factory out-of-box).
+//   * no creds, no flag   -> adopt the previous firmware's STA network if the WiFi driver kept
+//                            one (first boot after OTA); else IDLE: WiFi off, dormant.
 //   * provision flag set  -> SoftAP for setup. The flag is set ONLY when the user holds the
 //                            FAN button ~8 s, which makes the MCU raise reset bit0
 //                            (reset_provision). We then wipe the `wifi` NVS namespace
@@ -49,6 +50,28 @@ static bool load_creds(char *ssid, size_t ssz, char *pass, size_t psz) {
     return e == ESP_OK && ssid[0];
 }
 
+// First boot after an OTA from other firmware: our `wifi` namespace is empty, but the
+// previous firmware may have left its STA network in the WiFi driver's own NVS (nvs.net80211,
+// the default WIFI_STORAGE_FLASH). Adopt it into `wifi` once, so a unit that was already on
+// Wi-Fi comes up on the LAN instead of dormant. The FAN-hold reset wipes the driver copy
+// too (esp_wifi_restore), so wiped creds never come back this way.
+static bool adopt_driver_creds(char *ssid, size_t ssz, char *pass, size_t psz) {
+    wifi_config_t wc = {0};
+    if (esp_wifi_get_config(WIFI_IF_STA, &wc) != ESP_OK || !wc.sta.ssid[0]) return false;
+    // driver fields are fixed-size and not NUL-terminated when full
+    snprintf(ssid, ssz, "%.*s", (int)sizeof wc.sta.ssid, (const char *)wc.sta.ssid);
+    snprintf(pass, psz, "%.*s", (int)sizeof wc.sta.password, (const char *)wc.sta.password);
+    nvs_handle_t nv;
+    if (nvs_open("wifi", NVS_READWRITE, &nv) == ESP_OK) {
+        nvs_set_str(nv, "ssid", ssid);
+        nvs_set_str(nv, "pass", pass);
+        nvs_commit(nv);
+        nvs_close(nv);
+    }
+    ESP_LOGI(TAG, "adopted STA creds for '%s' from the WiFi driver NVS", ssid);
+    return true;
+}
+
 static bool provision_pending(void) {
     nvs_handle_t nv;
     uint8_t v = 0;
@@ -64,6 +87,7 @@ static bool provision_pending(void) {
 static void enter_provisioning_and_reboot(void) {
     nvs_handle_t nv;
     if (nvs_open("wifi", NVS_READWRITE, &nv) == ESP_OK) { nvs_erase_all(nv); nvs_commit(nv); nvs_close(nv); }
+    esp_wifi_restore();            // driver's persisted STA config too (see adopt_driver_creds)
     if (nvs_open("cfg",  NVS_READWRITE, &nv) == ESP_OK) { nvs_set_u8(nv, "provision", 1); nvs_commit(nv); nvs_close(nv); }
     ESP_LOGI(TAG, "MCU wifi-reset (FAN 8s): creds wiped, rebooting into AP setup");
     esp_restart();
@@ -110,6 +134,7 @@ static void start_mdns(void) {
 static void retry_cb(void *a) { esp_wifi_connect(); }
 
 static void on_wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
+    if (s_ap_mode) return;         // setup: the STA side only scans (GET /scan), never connects
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -166,7 +191,9 @@ static void start_ap(void) {
     wc.ap.channel        = 1;
     wc.ap.max_connection = 4;
     wc.ap.authmode       = WIFI_AUTH_OPEN;
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    // APSTA, not AP: the STA side lets the setup page scan for networks (GET /scan). It
+    // never connects — on_wifi_evt ignores STA events while s_ap_mode is set.
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_LOGI(TAG, "SoftAP '%s' up — http://192.168.4.1/", wc.ap.ssid);
@@ -212,9 +239,10 @@ void app_main(void) {
 
     char ssid[33] = {0}, pass[65] = {0};
     if (provision_pending()) {
+        s_ap_mode = true;         // set first: STA_START fires inside start_ap()
         start_ap();
-        s_ap_mode = true;
-    } else if (load_creds(ssid, sizeof ssid, pass, sizeof pass)) {
+    } else if (load_creds(ssid, sizeof ssid, pass, sizeof pass) ||
+               adopt_driver_creds(ssid, sizeof ssid, pass, sizeof pass)) {
         start_sta(ssid, pass);
     } else {
         ESP_LOGI(TAG, "no creds — idle, no AP (hold FAN ~8 s to set up WiFi)");

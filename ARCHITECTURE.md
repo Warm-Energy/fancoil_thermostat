@@ -68,6 +68,7 @@ stays live in **pair mode** (`degraded`) and retries single polls every 5 min.
 | `/set` | POST | change control/config fields (partial JSON) |
 | `/ota` | POST | flash a firmware image (raw `.bin` body) |
 | `/wifi` | POST | set Wi-Fi credentials (provisioning) |
+| `/scan` | GET | nearby Wi-Fi networks for the setup page (SoftAP mode only) |
 | `/reboot` | POST | reboot the device |
 | `/log` | GET | raw MCU frame sniffer (diagnostics) |
 | `/mcu/test`, `/light` | GET | MCU link diagnostics (state, counters, verdict) |
@@ -100,6 +101,14 @@ is intentionally open so the unit stays user-reflashable. Rollback (below) is th
 
 On first boot or after a reprovision, the device raises AP `fancoil-<mac>` at `192.168.4.1`
 and serves a plain setup page (Wi-Fi SSID/password → `POST /wifi`). No app or BLE needed.
+
+- **Network list:** the AP runs as APSTA so the page can call `GET /scan`: nearby 2.4 GHz
+  networks, strongest first, one per SSID, hidden ones skipped. Tap one to fill the SSID;
+  typing still works for hidden networks. The STA side never connects while in setup.
+- **Adopting an existing network:** with no saved credentials and no reprovision pending,
+  the first boot after an OTA from other firmware takes the STA network the Wi-Fi driver
+  kept (`nvs.net80211`) and saves it, so a unit that was already on Wi-Fi stays on it. The
+  FAN-hold reset also runs `esp_wifi_restore()`, so wiped credentials can't come back.
 
 ## OTA & rollback
 

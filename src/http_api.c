@@ -12,6 +12,7 @@
 #include "esp_system.h"
 #include "esp_mac.h"
 #include "esp_log.h"
+#include "esp_wifi.h"
 #include "nvs.h"
 #include "cJSON.h"
 #include "mcu_link.h"
@@ -40,11 +41,23 @@ static esp_err_t h_root(httpd_req_t *r) {
         httpd_resp_sendstr_chunk(r,
             "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
             "<h2>FanCoil.co.uk setup</h2>"
+            "<p>Pick your network (2.4 GHz only) or type it below. "
+            "<button type=button onclick=sc()>Rescan</button> <b id=sv></b></p><div id=nl></div>"
             "<form onsubmit=\"event.preventDefault();fetch('/wifi',{method:'POST',"
             "body:JSON.stringify({ssid:s.value,password:p.value})}).then(_=>b.textContent="
             "'Saved - rebooting, reconnect to your network.')\">"
             "SSID <input id=s><br>Password <input id=p type=password><br>"
-            "<button>Save</button></form><p id=b></p>");
+            "<button>Save</button></form><p id=b></p>"
+            // SSIDs are untrusted (any neighbour can name one) -> textContent only, never innerHTML
+            "<script>function sc(){sv.textContent='scanning...';"
+            "fetch('/scan').then(r=>r.json()).then(a=>{nl.replaceChildren();"
+            "sv.textContent=a.length?'':'no networks found';a.forEach(n=>{"
+            "var d=document.createElement('button');d.type='button';"
+            "d.style='display:block;width:100%;max-width:24em;text-align:left;margin:3px 0;padding:6px';"
+            "d.textContent=n.ssid+(n.open?'':' \\u{1F512}')+'  '+"
+            "(n.rssi>-60?'strong':n.rssi>-72?'good':'weak')+' ('+n.rssi+' dBm)';"
+            "d.onclick=()=>{s.value=n.ssid;p.value='';p.focus()};nl.append(d)})})"
+            ".catch(_=>sv.textContent='scan failed - type the network name')}sc()</script>");
     } else {
         httpd_resp_sendstr_chunk(r,
             "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -211,6 +224,40 @@ static esp_err_t h_wifi(httpd_req_t *r) {
     httpd_resp_sendstr(r, "saved");
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
+    return ESP_OK;
+}
+
+// AP setup only: GET /scan — nearby networks for the setup page, strongest first, one entry
+// per SSID, hidden ones skipped. Blocking scan, ~2 s. Needs the AP in APSTA (see start_ap).
+static int by_rssi(const void *a, const void *b) {
+    return ((const wifi_ap_record_t *)b)->rssi - ((const wifi_ap_record_t *)a)->rssi;
+}
+
+static esp_err_t h_scan(httpd_req_t *r) {
+    if (esp_wifi_scan_start(NULL, true) != ESP_OK) return fail(r, "scan failed");
+    uint16_t n = 24;
+    wifi_ap_record_t *ap = calloc(n, sizeof *ap);
+    if (!ap) { esp_wifi_clear_ap_list(); return fail(r, "no memory"); }
+    esp_wifi_scan_get_ap_records(&n, ap);        // also frees the driver's list
+    qsort(ap, n, sizeof *ap, by_rssi);
+    cJSON *j = cJSON_CreateArray();
+    for (int i = 0; i < n; i++) {
+        const char *ssid = (const char *)ap[i].ssid;
+        bool dup = !ssid[0];                     // hidden network
+        for (int k = 0; k < i && !dup; k++) dup = !strcmp(ssid, (const char *)ap[k].ssid);
+        if (dup) continue;                       // same SSID seen stronger already
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "ssid", ssid);
+        cJSON_AddNumberToObject(o, "rssi", ap[i].rssi);
+        cJSON_AddBoolToObject(o, "open", ap[i].authmode == WIFI_AUTH_OPEN);
+        cJSON_AddItemToArray(j, o);
+    }
+    free(ap);
+    char *s = cJSON_PrintUnformatted(j);
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_sendstr(r, s ? s : "[]");
+    if (s) cJSON_free(s);
+    cJSON_Delete(j);
     return ESP_OK;
 }
 
@@ -387,6 +434,7 @@ void http_api_start(bool ap_mode) {
     REG("/set",   HTTP_POST, h_set,   NULL);
     REG("/ota",   HTTP_POST, h_ota,   NULL);
     REG("/wifi",  HTTP_POST, h_wifi,  NULL);
+    if (ap_mode) REG("/scan", HTTP_GET, h_scan, NULL);
     REG("/log",   HTTP_GET,  h_log,   NULL);
     REG("/mcu/test", HTTP_GET, h_mcu_test, NULL);
     REG("/mcu/trace",   HTTP_GET,  h_mcu_trace,   NULL);
