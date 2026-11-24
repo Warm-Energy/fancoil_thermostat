@@ -69,6 +69,7 @@ stays live in **pair mode** (`degraded`) and retries single polls every 5 min.
 | `/ota` | POST | flash a firmware image (raw `.bin` body) |
 | `/wifi` | POST | set Wi-Fi credentials (provisioning) |
 | `/scan` | GET | nearby Wi-Fi networks for the setup page (SoftAP mode only) |
+| `/wifi/reset` | POST | forget the Wi-Fi network and reboot into SoftAP setup (= FAN held ~8 s) |
 | `/reboot` | POST | reboot the device |
 | `/log` | GET | raw MCU frame sniffer (diagnostics) |
 | `/mcu/test`, `/light` | GET | MCU link diagnostics (state, counters, verdict) |

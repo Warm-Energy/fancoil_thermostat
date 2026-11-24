@@ -82,14 +82,15 @@ static bool provision_pending(void) {
     return v != 0;
 }
 
-// Called when the MCU requests a WiFi reset (user held FAN ~8 s). Wipes STA creds ONLY —
-// the `cfg` namespace (custom server/token) is preserved — arms AP setup, and reboots.
-static void enter_provisioning_and_reboot(void) {
+// Called when the MCU requests a WiFi reset (user held FAN ~8 s) or from POST /wifi/reset.
+// Wipes STA creds ONLY — the `cfg` namespace (custom server/token) is preserved — arms AP
+// setup, and reboots.
+void enter_provisioning_and_reboot(void) {
     nvs_handle_t nv;
     if (nvs_open("wifi", NVS_READWRITE, &nv) == ESP_OK) { nvs_erase_all(nv); nvs_commit(nv); nvs_close(nv); }
     esp_wifi_restore();            // driver's persisted STA config too (see adopt_driver_creds)
     if (nvs_open("cfg",  NVS_READWRITE, &nv) == ESP_OK) { nvs_set_u8(nv, "provision", 1); nvs_commit(nv); nvs_close(nv); }
-    ESP_LOGI(TAG, "MCU wifi-reset (FAN 8s): creds wiped, rebooting into AP setup");
+    ESP_LOGI(TAG, "wifi reset: creds wiped, rebooting into AP setup");
     esp_restart();
 }
 

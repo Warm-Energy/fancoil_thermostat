@@ -69,6 +69,11 @@ static esp_err_t h_root(httpd_req_t *r) {
             "<button onclick=\"if(confirm('Reboot the thermostat controller?'))"
             "fetch('/reboot',{method:'POST'}).then(_=>{rb.textContent=' rebooting...';"
             "setTimeout(()=>location.reload(),6000)})\">Reboot ESP32</button> <b id=rb></b>"
+            "<h3>Wi-Fi</h3>"
+            "<button onclick=\"if(confirm('Reset Wi-Fi? The thermostat forgets this network and "
+            "starts its setup hotspot; it drops off the network until you set it up again.'))"
+            "fetch('/wifi/reset',{method:'POST'}).then(r=>r.text()).then(t=>ws.textContent=' '+t)"
+            "\">Reset Wi-Fi (setup mode)</button> <b id=ws></b>"
             "<h3>Firmware</h3><span id=fv>?</span><br>"
             "<input type=file id=fw accept=.bin> "
             "<button onclick=up()>Upload &amp; flash</button> "
@@ -408,6 +413,20 @@ static esp_err_t h_light(httpd_req_t *r) {
     return ESP_OK;
 }
 
+// Forget the Wi-Fi and reboot into SoftAP setup, same as holding FAN ~8 s. POST so a
+// browser prefetch can't trip it. The reply names the hotspot (SoftAP MAC, not the STA one).
+static esp_err_t h_wifi_reset(httpd_req_t *r) {
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    char msg[128];
+    snprintf(msg, sizeof msg, "Resetting. Join Wi-Fi 'fancoil-%02x%02x' and open http://192.168.4.1/ "
+             "to set it up again.", mac[4], mac[5]);
+    httpd_resp_sendstr(r, msg);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    enter_provisioning_and_reboot();
+    return ESP_OK;
+}
+
 // Reboot the ESP (not the MCU). POST so a browser prefetch can't trip it.
 static esp_err_t h_reboot(httpd_req_t *r) {
     httpd_resp_sendstr(r, "rebooting");
@@ -435,6 +454,7 @@ void http_api_start(bool ap_mode) {
     REG("/ota",   HTTP_POST, h_ota,   NULL);
     REG("/wifi",  HTTP_POST, h_wifi,  NULL);
     if (ap_mode) REG("/scan", HTTP_GET, h_scan, NULL);
+    REG("/wifi/reset", HTTP_POST, h_wifi_reset, NULL);
     REG("/log",   HTTP_GET,  h_log,   NULL);
     REG("/mcu/test", HTTP_GET, h_mcu_test, NULL);
     REG("/mcu/trace",   HTTP_GET,  h_mcu_trace,   NULL);
